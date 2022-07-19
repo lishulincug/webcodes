@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>WebCodecs/WebTransport Chat DEMO</title>
+
+<meta http-equiv="origin-trial" content="Av+mvY2l3yz0AUHUSgQoy3hjxVyCRKjwch6wSJpKTvxApPfoMs42RjbvonsiiYrALlWkMX+Ky2/EHHUsuSUTAQUAAABheyJvcmlnaW4iOiJodHRwczovL2p4Y2suaW86NDQzIiwiZmVhdHVyZSI6IlF1aWNUcmFuc3BvcnQiLCJleHBpcnkiOjE2MDIzNDg2MzcsImlzU3ViZG9tYWluIjp0cnVlfQ==">
+
+<style>
+video, canvas {
+  display: block;
+  border: solid 1px black;
+}
+section {
+  display: flex;
+}
+input {
+  width: 3em;
+}
+</style>
+
+<h1>WebCodecs/WebTransport Chat DEMO</h1>
+
+<p>video -&gt; encode -&gt; quictransport -&gt; echoback -&gt; decode -&gt; canvas<p>
+<pre>
+$ open -a /Applications/Google\ Chrome\ Canary.app --args --enable-blink-features=WebCodecs
+</pre>
+
+<section>
+  <video id=local autoplay></video>
+  <canvas id=remote></canvas>
+</section>
+
+<button id=start autofocus>start</button>
+<button id=stop>stop</button>
+
+<label for=codec>codec:</label>
+<select id=codec name=codec>
+  <option value=vp8 selected>vp8 </option>
+  <option value=vp09.00.10.08>vp9</option>
+  <option value=avc1.4D401E>h264</option>
+  <option value=h265>h265</option>
+  <option value=av1 >av1 </option>
+  <option value=hevc>hevc</option>
+</select>
+
+<label for=framerate>framerate:</label>
+<input id=framerate type=number value=10>
+
+<label for=width>width:</label>
+<input id=width type=number value=320 step=10>
+
+<label for=height>height:</label>
+<input id=height type=number value=240 step=10>
+
+<script src=cbor.js></script>
+<script>
+  'use strict';
+  const $  = document.querySelector.bind(document)
+  const $$ = document.querySelectorAll.bind(document)
+  EventTarget.prototype.on = EventTarget.prototype.addEventListener
+
+  document.on('DOMContentLoaded', async (e) => {
+    const url = `quic-transport://labs.jxck.io:7000/echo`
+    const transport = new QuicTransport(url)
+    await transport.ready
+
+    const stream = await transport.createBidirectionalStream()
+    const writer = stream.writable.getWriter()
+    const reader = stream.readable.getReader()
+
+    // const writer = transport.sendDatagrams().getWriter()
+    // const reader = transport.receiveDatagrams().getReader()
+
+    $('#start').on('click', async (e) => {
+      const codec     = $('#codec').value
+      const framerate = $('#framerate').value
+      const width     = $('#width').value
+      const height    = $('#height').value
+      // const bitrate   = 10*1024
+
+      // Canvas
+      const $canvas  = $('#remote')
+      $canvas.width  = width
+      $canvas.height = height
+      const ctx = $canvas.getContext('2d')
+
+      // Video
+      const $video = $('#local')
+      $video.srcObject = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { width, height }
+      })
+      const [videoTrack] = $video.srcObject.getVideoTracks()
+
+      // Decoder
+      const videoDecoder = new VideoDecoder({
+        output: async (chunk) => {
+          // console.log(chunk)
+          const imageBitmap = await chunk.createImageBitmap()
+          // console.log(imageBitmap)
+          ctx.drawImage(imageBitmap, 0, 0)
+        },
+        error: function() {
+          console.error(arguments)
+        }
+      })
+
+      videoDecoder.configure({
+        codec
+      })
+
+
+      // Encoder
+      const videoEncoder = new VideoEncoder({
+        output: function(chunk) {
+          console.log(chunk.type)
+
+          const { type, timestamp, duration, data } = chunk
+          const encoded = new Uint8Array(CBOR.encode({
+            type, timestamp, duration,
+            data: new Uint8Array(data),
+          }))
+          const size = new Uint8Array(4)
+          const view = new DataView(size.buffer)
+          view.setUint32(0, encoded.length)
+          writer.write(new Uint8Array([...size, ...encoded]))
+        },
+        error: function() {
+          console.error(arguments)
+        }
+      })
+      await videoEncoder.configure({
+        codec, framerate, width, height //, bitrate
+      })
+
+      const videoReader = (new MediaStreamTrack(videoTrack))
+      let i = 0
+      videoReader.start(async (videoFrame) => {
+        const option = {keyFrame: false}
+        if (i === 0) option.keyFrame = true
+        if (i++ > 10) i = 0
+        videoEncoder.encode(videoFrame, option)
+      })
+
+      $('#stop').on('click', () => {
+        videoReader.stop()
+        $('video').pause()
+      })
+
+      while(true) {
+        try {
+          let {done, value} = await reader.read()
+          const view   = new DataView(value.buffer)
+          const size   = view.getUint32(0)
+          let   buffer = value.slice(4)
+
+          while (buffer.length < size) {
+            let {done, value} = await reader.read()
+            buffer = new Uint8Array([...buffer, ...value])
+          }
+
+          // Encode Chunk
+          const chunk   = CBOR.decode(buffer.buffer)
+          const encoded = new EncodedVideoChunk(chunk)
+          videoDecoder.decode(encoded)
+
+          if (done) break;
+        } catch (err) {
+          console.error(err)
+        }
+      }
+
+    })
+
+
+    // setTimeout(() => {
+    //   console.log('stop')
+    //   videoReader.stop()
+    // }, 10000)
+
+    // $('#start').click()
+  })
+</script>
+
+<p><a href=https://docs.google.com/document/d/1H1UHn3DIw-LOfBUdNUFR6l2-zSipXuHCVmhrwF3rR6w/>WebCodecs in Chrome M86: Limitations</a>

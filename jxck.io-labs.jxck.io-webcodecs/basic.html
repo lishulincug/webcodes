@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>WebCodecs DEMO</title>
+
+<style>
+video, canvas {
+  display: block;
+  border: solid 1px black;
+}
+section {
+  display: flex;
+}
+input {
+  width: 3em;
+}
+</style>
+
+<h1>WebCodecs DEMO</h1>
+
+<p>encode / decode video stream locally<p>
+<pre>
+$ open -a /Applications/Google\ Chrome\ Canary.app --args --enable-blink-features=WebCodecs
+</pre>
+
+<section>
+  <video id=local autoplay></video>
+  <canvas id=remote></canvas>
+</section>
+
+<button id=start autofocus>start</button>
+<button id=stop>stop</button>
+
+<label for=codec>codec:</label>
+<select id=codec name=codec>
+  <option value=vp8 selected>vp8 </option>
+  <option value=vp09.00.10.08>vp9</option>
+  <option value=avc1.4D401E>h264</option>
+  <option value=h265>h265</option>
+  <option value=av1 >av1 </option>
+  <option value=hevc>hevc</option>
+</select>
+
+<label for=framerate>framerate:</label>
+<input id=framerate type=number value=30>
+
+<label for=width>width:</label>
+<input id=width type=number value=640 step=10>
+
+<label for=height>height:</label>
+<input id=height type=number value=480 step=10>
+
+<script>
+  'use strict';
+  const $  = document.querySelector.bind(document)
+  const $$ = document.querySelectorAll.bind(document)
+  EventTarget.prototype.on = EventTarget.prototype.addEventListener
+
+  $('#start').on('click', async (e) => {
+    console.log(e)
+
+    const codec     = $('#codec').value
+    const framerate = $('#framerate').value
+    const width     = $('#width').value
+    const height    = $('#height').value
+    // const bitrate   = 10*1024
+
+    // Canvas
+    const $canvas = $('#remote')
+    const ctx = $canvas.getContext('2d')
+    $canvas.width = width
+    $canvas.height = height
+
+    // VideoStream
+    const mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        width, height
+      }
+    })
+    $('#local').srcObject = mediaStream
+    const [videoTrack] = mediaStream.getVideoTracks()
+
+    // Decoder
+    const videoDecoder = new VideoDecoder({
+      output: async function(chunk) {
+        console.log(chunk)
+        const imageBitmap = await chunk.createImageBitmap()
+        console.log(imageBitmap)
+        ctx.drawImage(imageBitmap, 0, 0)
+      },
+      error: function() {
+        console.error(arguments)
+      }
+    })
+    videoDecoder.configure({ codec })
+
+    // Encoder
+    const videoEncoder = new VideoEncoder({
+      output: function(chunk) {
+        console.log(chunk)
+        videoDecoder.decode(chunk)
+      },
+      error: function() {
+        console.error(arguments)
+      }
+    })
+    await videoEncoder.configure({
+      codec, framerate, width, height //, bitrate
+    })
+
+
+    const videoReader = (new MediaStreamTrack(videoTrack))
+    console.log(videoReader)
+    videoReader.start(async (videoFrame) => {
+      videoEncoder.encode(videoFrame)
+    })
+
+
+    $('#stop').on('click', () => {
+      console.log(mediaStream)
+      videoReader.stop()
+      $('video').pause()
+    })
+
+    // setTimeout(() => {
+    //   $('#stop').click()
+    // }, 3000)
+  })
+</script>
+
+<p><a href=https://docs.google.com/document/d/1H1UHn3DIw-LOfBUdNUFR6l2-zSipXuHCVmhrwF3rR6w/>WebCodecs in Chrome M86: Limitations</a>

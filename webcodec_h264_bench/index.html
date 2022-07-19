@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <style>
+            * { font-family: sans-serif; }
+            progress { 
+                margin-left: 5px;
+                float: right;
+            }
+
+            th { font-weight: bold; }
+            td { padding: 5px; }
+            table td + td { border-left: 1px solid black; }
+            tr:nth-child(even) { background-color: #f2f2f2; }
+
+            /*table { margin: 5px; }*/
+
+            #progress-bar-holder {
+                width: fit-content;
+                height: 100px;
+                overflow-y: scroll;
+            }
+        </style>
+    </head>
+    <body>
+        <button onclick="runBench()">run benchmark</button>
+        
+
+        <h1>results</h1>
+        <table id="results"></table>
+
+        <h1>tasks</h1>
+        <div id="progress-bar-holder"></div>
+
+        <script>
+            function* permutate(obj) {
+                let wasPermFound = false;
+                for (const key in obj) {
+                    const perms = obj[key];
+                    if (wasPermFound |= Array.isArray(perms)) {
+                        for (const perm of perms) {
+                            const newObj = {};
+                            Object.assign(newObj, obj);
+                            newObj[key] = perm;
+                            yield* permutate(newObj);
+                        }
+                        break;
+                    }
+                }
+                if (!wasPermFound) yield obj;
+            }
+
+            async function loadVideo(codec, progressCb = (p) => {}, numFrames = 450) {
+                const reses = [];
+                let downloaded = 0;
+
+                const ext = {
+                    avc1: "h264",
+                    hev1: "h265",
+                    hvc1: "h265",
+                    vp09: "vp9",
+                }[codec.replace(/\..*/, '')];
+
+                for (let i = 0; i < numFrames; i++) {
+                    const url = `${codec.replaceAll('.', '_')}/${(i + 1).toString().padStart(3, '0')}.${ext}`;
+                    //console.log(url);
+                    reses[i] = fetch(url).then(async (f) => {
+                        const buf = await f.arrayBuffer();
+                        progressCb((++downloaded) / numFrames);
+                        return new EncodedVideoChunk({
+                            type: "key",
+                            timestamp: i,
+                            duration: 1,
+                            data: buf
+                        });
+                    });
+                }
+                return await Promise.all(reses);
+            }
+
+            class AsyncVideoDecoder extends VideoDecoder {
+                constructor() {
+                    super({ output: (f) => this.onOutput(f), error: (e) => this.onError(e) });
+                    this.latencies = [];
+                    this.submitTimes = [];
+                }
+
+                reset() {
+                    this.latencies = [];
+                    this.submitTimes = [];
+                    return super.reset();
+                }
+
+                onOutput(frame) {
+                    this.latencies[frame.timestamp] = performance.now() - this.submitTimes[frame.timestamp];
+                    frame.close();
+                }
+
+                onError(e) {
+                    throw e;
+                }
+
+                async decode(chunk) {
+                    this.submitTimes[chunk.timestamp] = performance.now();
+                    super.decode(chunk);
+
+                    while (super.decodeQueueSize) {
+                        await new Promise((res, rej) => setTimeout(res, 1));
+                    }
+                }
+            }
+
+            async function benchDecoder(config, encodedChunks, progressCb = (p) => {}) {
+
+                const logP = (p) => console.info(`${(p * 1e2).toFixed(2)}%`);
+                const dec = new AsyncVideoDecoder();
+                const testResults = {
+                    codec: config.codec,
+                    hwAccel: config.hardwareAcceleration,
+
+                    vidWidth: config.codedWidth,
+                    vidHeight: config.codedHeight,
+
+                    latencyRaw: [],
+                    latencyAvg: NaN,
+                    latencyStdDev: NaN,
+
+                    throughputData: NaN,
+                    throughputMPixPerSec: NaN,
+                };
+
+                // latency test
+                dec.configure(config);
+                
+                for (const i in encodedChunks) {
+                    await dec.decode(encodedChunks[i]);
+                    progressCb(i * 0.5 / encodedChunks.length);
+                }
+                await dec.flush();
+                
+                testResults.latencyRaw = dec.latencies;
+                const latencySum = dec.latencies.reduce((a, b) => a + b);
+                testResults.latencyAvg = latencySum / dec.latencies.length;
+                testResults.latencyStdDev = Math.sqrt(
+                    dec.latencies.map((a) => Math.pow(a - testResults.latencyAvg, 2)).reduce((a, b) => a + b) / dec.latencies.length
+                );
+
+                dec.reset();
+
+                // throughput test
+                dec.configure(config);
+
+                const startTime = performance.now();
+                for (const i in encodedChunks) dec.decode(encodedChunks[i]);
+                const progressCbHandle = setInterval(() => {
+                    progressCb((encodedChunks.length - dec.decodeQueueSize) * 0.5 / encodedChunks.length + 0.5);
+                });
+                await dec.flush();
+                clearInterval(progressCbHandle);
+
+                testResults.throughputData = performance.now() - startTime;
+                testResults.throughputMPixPerSec = testResults.vidWidth * testResults.vidHeight * encodedChunks.length / (testResults.throughputData * 1e3);
+
+                dec.close();
+
+                return testResults;
+            }
+
+            async function fetchTestVids(testConfigs, progressCb = (codec, p) => {}) {
+                const configPermutations = permutate(testConfigs),
+                    testVids = {},
+                    supportedConfigs = [],
+                    prepPromises = [];
+                let nextConfigPermutation;
+
+                while (!(nextConfigPermutation = configPermutations.next()).done) {
+                    const testConfig = nextConfigPermutation.value;
+                    prepPromises.push(
+                        VideoDecoder.isConfigSupported(testConfig).then(async (res) => {
+                            const {config, supported} = res;
+
+                            if (supported) {
+                                if (!(config.codec in testVids)) {
+                                    testVids[config.codec] = [];
+                                }
+                                supportedConfigs.push(config); 
+                            }
+                        })
+                    );
+                }
+
+                await Promise.all(prepPromises);
+
+                for (const codec in testVids) {
+                    testVids[codec] = await loadVideo(codec, (p) => {
+                        progressCb(codec, p);
+                    });
+                }
+
+                return [supportedConfigs, testVids];
+            }
+
+            async function runBench() {
+
+                const testParams = {
+                    codec: [
+                        // "avc1.42002a",      // avc baseline profile
+                        // "avc1.4d002a",      // avc main profile
+                        // "avc1.64002a",      // avc high profile
+                        // "vp09.00.40.08.00.01.01.01.00", // vp9 level 4.1
+                        "hev1.1.2.L123",    // hevc main L4.1
+                        "hev1.1.2.L153",    // hevc main L5.1
+                        "hev1.1.2.L183",    // hevc main L6.1
+                    ],
+                    codedWidth: 1088,
+                    codedHeight: 1088,
+                    optimizeForLatency: true,
+                    hardwareAcceleration: ["prefer-hardware", "prefer-software"]
+                };
+                const progressBarHolder = document.getElementById("progress-bar-holder");
+                const resultsTable = document.getElementById("results");
+                const progressBars = {};
+
+                const addProgressBar = (name) => {
+                    const progressBar = document.createElement("progress");
+                    const progressBarLabel = document.createElement("label");
+                    progressBar.max = 1.0;
+                    progressBar.value = 0.0;
+                    progressBarLabel.innerText = name;
+
+                    progressBarHolder.append(progressBarLabel, progressBar, document.createElement("br"));
+
+                    return progressBar;
+                }
+
+                console.log("downloading test videos...");
+
+                const [supportedConfigs, testVids] = await fetchTestVids(testParams, (codec, p) => {
+                    if (codec in progressBars) {
+                        progressBars[codec].value = p;
+                        progressBarHolder.scrollTop = progressBarHolder.scrollHeight;
+                    } else {
+                        progressBars[codec] = addProgressBar(`download ${codec}`);
+                    }
+                });
+
+                const testResults = [];
+                const tableHeaders = [
+                    "codec", 
+                    "hwAccel",
+                    "latencyAvg",
+                    "latencyStdDev",
+                    "throughputMPixPerSec"
+                ];
+
+                const headerRow = resultsTable.insertRow();
+
+                for (const tableHeader of tableHeaders) {
+                    const headerCell = headerRow.insertCell();
+                    headerCell.innerText = tableHeader;
+                    headerCell.style.fontWeight = "bold";
+                }
+
+                console.log("done!", testVids);
+
+                for (const config of supportedConfigs) {
+                    console.log("testing", config);
+
+                    const codecBar = addProgressBar(`running ${config.codec}/${config.hardwareAcceleration}`);
+
+                    const row = resultsTable.insertRow(-1);
+
+                    try {
+                        const testResult = await benchDecoder(config, testVids[config.codec], (p) => {
+                            codecBar.value = p;
+                            progressBarHolder.scrollTop = progressBarHolder.scrollHeight;
+                        });
+                        
+                        for (const key of tableHeaders) {
+                            const v = testResult[key];
+                            row.insertCell().innerText = typeof(v) === "number" ? v.toPrecision(4) : v;
+                        }
+
+                        testResults.push(testResult);
+                    } catch (e) {
+                        const errCell = row.insertCell();
+                        errCell.style.fontWeight = "bold";
+                        errCell.style.color = "red";
+                        errCell.style.textAlign = "center";
+                        errCell.colSpan = tableHeaders.length;
+                        errCell.innerText = e;
+                    }
+                }
+
+                console.table(testResults);
+
+                const resultsBlob = new Blob([JSON.stringify(testResults)], { type: "octet/stream" });
+                resultsBlob.url = window.URL.createObjectURL(resultsBlob);
+
+                const dlLink = document.createElement("a");
+                dlLink.href = resultsBlob.url;
+                dlLink.download = dlLink.innerText = "results.json";
+
+                document.body.appendChild(dlLink);
+            };
+        </script>
+    </body>
+</html>
